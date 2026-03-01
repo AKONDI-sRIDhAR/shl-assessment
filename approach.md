@@ -1,204 +1,144 @@
-# Approach Document — SHL AI Assessment Recommendation Engine
+# Approach
+
+## Problem
+
+Given a natural-language query -- a job title, skill list, or full job
+description -- recommend the most relevant assessments from SHL's catalog of
+~390 individual test solutions.  Return a ranked list with scores and handle
+everything from purely technical roles to behavioural/personality roles.
 
 ---
 
-## 1. Problem Statement
+## Architecture
 
-Given a natural-language query (job description, role title, or skill requirement), recommend the most relevant SHL assessments from a catalog of ~380 individual test solutions. The system must return the top-K assessments with relevance scores and support balanced recommendations across Knowledge (K) and Personality (P) test types.
+I split the system into three layers:
 
----
+- **utils.py** -- core recommendation logic (model loading, FAISS search,
+  K/P balance, reason generation).  Imported by both the UI and the API.
+- **app.py** -- Streamlit frontend for interactive use.  HR professionals
+  type a query, see ranked cards with clickable SHL links.
+- **api.py** -- FastAPI backend with `GET /health` and `POST /recommend`
+  endpoints.  This is the programmatic interface that automated evaluators
+  or downstream systems can call.
 
-## 2. System Architecture
+Splitting UI from API means either can be deployed independently.  The
+Streamlit app goes on Streamlit Cloud; the API can go on Render, Railway,
+or any container host.
 
-### High-Level Design
+### Data Pipeline
 
-The system follows a **two-phase architecture**:
+I scraped the SHL Product Catalog filtered to "Individual Test Solutions"
+(`?type=1`), 32 paginated pages, ~389 assessments.  For each one I visited
+the detail page and extracted description, duration, job levels, languages,
+and test-type badges (K, P, A, B, etc.).
 
-**Phase 1: Offline Data Pipeline (scraper.py)**
-```
-SHL Catalog → Web Scraping → Data Enrichment → Embedding Generation → FAISS Indexing
-```
-
-**Phase 2: Online Query Pipeline (app.py)**
-```
-User Query → Embedding → FAISS Nearest-Neighbor Search → Balance Re-ranking → Results
-```
-
-### Component Breakdown
-
-| Component | Purpose | Technology |
-|-----------|---------|-----------|
-| **Scraper** | Extract assessment data from SHL catalog | `requests`, `BeautifulSoup4`, `lxml` |
-| **Embedding Generator** | Create dense vector representations of assessment descriptions | `sentence-transformers/all-MiniLM-L6-v2` |
-| **Vector Store** | Enable fast similarity search across 380+ assessments | `FAISS` (IndexFlatIP) |
-| **Query Encoder** | Convert user query to same embedding space | Same `all-MiniLM-L6-v2` model |
-| **Re-ranker** | Balance K vs P assessment types based on query intent | Keyword analysis + score boosting |
-| **Web UI** | Interactive recommendation interface | `Streamlit` |
-
----
-
-## 3. Why Embeddings + FAISS?
-
-### Why Semantic Embeddings?
-
-Traditional keyword-matching approaches (TF-IDF, BM25) fail when:
-- The query uses different terminology than the assessment description (e.g., "coding test" vs. "programming knowledge assessment")
-- The query is a full job description with many irrelevant details
-- Assessments are described in domain-specific SHL terminology
-
-**Sentence-transformer embeddings** (specifically `all-MiniLM-L6-v2`) solve this by:
-- Mapping both queries and assessments into a shared 384-dimensional semantic space
-- Capturing synonyms, paraphrases, and contextual similarity
-- Being pre-trained on 1B+ sentence pairs from diverse domains
-- Running fast enough for real-time inference (~50ms per query)
-
-### Why FAISS?
-
-FAISS (Facebook AI Similarity Search) provides:
-- **Speed**: Sub-millisecond search over 380 vectors (exact search with `IndexFlatIP`)
-- **Scalability**: Could handle millions of assessments with approximate indices (IVF, HNSW)
-- **Memory efficiency**: Compact binary format for index persistence
-- **Cosine similarity**: Using `IndexFlatIP` on L2-normalized vectors is mathematically equivalent to cosine similarity
-
-For our catalog size (~380 items), exact search is fast enough, so we use `IndexFlatIP` rather than approximate methods. If the catalog grew to 100K+ items, we would switch to `IndexIVFFlat` or `IndexHNSWFlat`.
-
-### Why all-MiniLM-L6-v2?
-
-| Factor | Value |
-|--------|-------|
-| Embedding dimension | 384 |
-| Model size | ~80MB |
-| Inference speed | ~14K sentences/sec on CPU |
-| Quality (STS Benchmark) | 82.8% Spearman correlation |
-| Trained on | 1B+ diverse sentence pairs |
-
-This model strikes the best balance between quality and speed for our use case. Larger models (e.g., `all-mpnet-base-v2`) offer marginal quality gains but are 3x slower.
-
----
-
-## 4. Rich Text Construction
-
-For each assessment, we construct a `rich_text` field that combines all available metadata into a single string for embedding:
-
+All fields are combined into a `rich_text` string:
 ```
 Title: {name}
 Description: {description}
-Test Types: {test_type_codes}
+Test Types: {test_types}
 Duration: {duration}
 Job Levels: {job_levels}
 ```
 
-This approach ensures:
-- The embedding captures the **full semantic context** of each assessment
-- Test type codes (K, P, A, B, S) are included, allowing the model to learn associations between assessment types and relevant queries
-- Duration and job levels add contextual signals for matching
+This string gets embedded.
 
 ---
 
-## 5. Balance Handling (K ↔ P Re-ranking)
+## Why Embeddings + FAISS
 
-### The Problem
+Keyword matching breaks when phrasing differs.  "Coding test" should match
+"Java Programming Knowledge Assessment" even though they share no exact
+words.  Sentence-transformer embeddings handle this because the model
+understands synonyms and context.
 
-Pure cosine similarity may return results that cluster around one test type. For example, a query about "software developers" might return only Knowledge (K) tests, missing relevant Personality (P) tests for cultural fit evaluation.
+I chose **all-MiniLM-L6-v2**: 384 dimensions, 80 MB, 82.8% STS benchmark.
+Good balance of quality and speed -- fast enough for real-time queries on
+CPU, small enough to deploy on free-tier hosting.
 
-### The Solution
-
-When the "Balance" toggle is enabled, the system applies a **two-step re-ranking**:
-
-**Step 1: Query Intent Classification**
-```python
-tech_ratio, behav_ratio = detect_query_intent(query)
-```
-- Scans the query for technical keywords (coding, SQL, algorithms, etc.)
-- Scans for behavioral keywords (leadership, teamwork, culture, etc.)
-- Computes a ratio: e.g., `tech_ratio=0.7, behav_ratio=0.3`
-
-**Step 2: Score Boosting**
-```python
-if "K" in test_types and tech_ratio > 0.5:
-    score += 0.05 * tech_ratio  # Boost Knowledge tests for technical queries
-if "P" in test_types and behav_ratio > 0.5:
-    score += 0.05 * behav_ratio  # Boost Personality tests for behavioral queries
-```
-
-The boost is **proportional** to the intent strength, ensuring:
-- Strong technical queries get a meaningful K boost
-- Mixed queries get moderate, balanced boosting
-- The base cosine similarity score remains the primary ranking signal
-
-### Why This Works
-
-- Boosts are small (max ±0.05) — they nudge, not override, semantic similarity
-- Uses two keyword dictionaries (30+ words each) for robust intent detection
-- Handles edge cases: queries with no clear intent get equal 0.5/0.5 ratios (no boost)
-- Preserves diversity: a technical query won't lose ALL personality tests, just de-prioritize them slightly
+For the index I used FAISS `IndexFlatIP` on L2-normalised vectors.  Inner
+product on normalised vectors equals cosine similarity.  With ~389 items
+exact search is sub-millisecond; no need for approximate methods.
 
 ---
 
-## 6. Estimated Performance
+## K/P Balance
 
-### Recall@K Estimation
+Pure cosine similarity can cluster results toward one test type.  Searching
+"Python developer" might return only Knowledge tests, missing Personality
+tests for cultural fit.
 
-Based on the design and typical performance of similar semantic search systems:
+When the balance toggle is on, I classify the query into a technical ratio
+and a behavioural ratio using two keyword sets (~35 words each).  Then I add
+a small boost:
 
-| Metric | Estimated | Rationale |
-|--------|:---------:|-----------|
-| **Recall@3** | ~0.65 | Top-3 results contain relevant assessments ~65% of the time |
-| **Recall@5** | ~0.70 | Broader coverage catches more relevant types |
-| **Recall@10** | ~0.78 | Most relevant assessments appear within top-10 |
-| **MAP@10** | ~0.60 | Relevant results tend to be ranked higher |
+- Technical queries: K and A results get up to +0.05
+- Behavioural queries: P and B results get up to +0.05
 
-### Factors Affecting Performance
-
-- **Data quality**: Rich descriptions improve embedding quality significantly
-- **Query specificity**: Specific role queries (e.g., "Java developer") perform better than vague queries (e.g., "good test")
-- **Catalog coverage**: SHL's catalog may not have assessments for every possible query
-- **Balance re-ranking**: Can improve Recall for mixed-intent queries by +5-10%
+The boost is proportional to intent strength.  A mixed query like "Java
+developer who handles customer calls" gets moderate nudges both ways.  The
+base similarity score stays the primary signal.
 
 ---
 
-## 7. Trade-offs & Design Decisions
+## Why a Minimal UI
 
-| Decision | Trade-off |
-|----------|-----------|
-| **MiniLM-L6 over larger models** | Smaller model (80MB) is deployable on Streamlit Cloud free tier; marginal quality loss |
-| **FAISS IndexFlatIP over IVF** | Exact search is fine for 380 items; no approximation error |
-| **Keyword-based balance over ML classifier** | Simpler, transparent, no additional training data needed |
-| **Pre-computed embeddings over real-time** | Faster queries; requires re-scraping if catalog changes |
-| **Single rich_text embedding over multi-field** | Simpler architecture; may lose some field-specific signals |
-| **Static scraping over API** | SHL doesn't expose a public API; scraping is the only option |
+I went with a flat, dark, no-decoration interface.  The reasoning:
 
----
+- This is a tool for HR teams, not a portfolio site.  Readability over
+  aesthetics.
+- Flat cards with 1px borders scan faster than cards with shadows and
+  rounded corners.
+- Single accent colour (#00b4d8) keeps the interface consistent without
+  visual noise.
+- No gradients, no animations, no glassmorphism.  Every pixel is
+  functional.
 
-## 8. Future Improvements
-
-### Short-term (v2.0)
-
-1. **RAG with Gemini/GPT**: Use a LLM to generate more nuanced reasons for recommendations, incorporating the assessment description and query context
-2. **Cross-encoder re-ranking**: Use a cross-encoder model (e.g., `cross-encoder/ms-marco-MiniLM-L-6-v2`) as a second-stage ranker for improved precision
-3. **JD URL parsing**: Accept a URL, fetch the page content, and extract the job description automatically
-4. **Multi-field embeddings**: Embed name, description, and test types separately and combine with learned weights
-
-### Medium-term (v3.0)
-
-5. **User feedback loop**: Allow users to rate recommendations; use feedback to fine-tune embeddings
-6. **Hybrid search**: Combine semantic search with BM25 keyword search (Reciprocal Rank Fusion)
-7. **Assessment compatibility matrix**: Model which assessments work well together as a battery
-8. **Caching layer**: Cache frequent queries for sub-10ms responses
-
-### Long-term (v4.0)
-
-9. **Fine-tuned domain embeddings**: Train/fine-tune on SHL-specific assessment data
-10. **Active learning**: Use evaluation results to continuously improve the recommendation quality
-11. **Multi-language support**: Support queries in non-English languages
-12. **API gateway**: Expose recommendations as a REST API for integration with ATS platforms
+The design matches SHL's own product pages -- clean, corporate, focused on
+data.
 
 ---
 
-## 9. Conclusion
+## Estimated Performance
 
-This recommendation engine demonstrates a practical, production-ready approach to assessment recommendation using modern NLP techniques. The combination of dense semantic embeddings with FAISS provides fast, accurate retrieval, while the balance re-ranking mechanism ensures diverse, role-appropriate recommendations. The architecture is extensible, allowing future enhancements with minimal changes to the core pipeline.
+| Metric | Estimated |
+|--------|-----------|
+| Recall@3 | ~0.65 |
+| Recall@5 | ~0.70 |
+| Recall@10 | ~0.78 |
+| MAP@10 | ~0.60 |
+
+Specific queries ("knowledge tests for .NET") perform best.  Vague queries
+("good test for graduates") are harder because many assessments are
+potentially relevant.
 
 ---
 
-*Document prepared for the SHL AI Intern / Research Engineer assignment (2025-2026)*
+## Trade-Offs
+
+| Decision | Why |
+|----------|-----|
+| MiniLM-L6 over larger models | Deploys on free-tier hosting, marginal quality loss |
+| Exact FAISS over approximate | 389 items, no need for approximation |
+| Keyword balance over ML classifier | Transparent, no training data needed |
+| UI + API split over monolith | Each deploys independently, cleaner separation |
+| Flat design over flashy | Matches corporate expectations, faster to read |
+
+---
+
+## Future Improvements
+
+1. **Cross-encoder re-ranker** -- second-stage model that jointly encodes
+   query + assessment for better ranking precision.
+2. **RAG with Gemini** -- generate natural-language explanations per result
+   instead of keyword-overlap reasons.
+3. **Hybrid search** -- combine embeddings with BM25 via Reciprocal Rank
+   Fusion to catch exact-match keywords.
+4. **Feedback loop** -- let users rate results, fine-tune embeddings on
+   SHL-specific data.
+5. **JD URL ingestion** -- accept a URL, scrape the job description, use it
+   as the query automatically.
+
+---
+
+_Written for the SHL AI Intern / Research Engineer assignment, Feb 2026._

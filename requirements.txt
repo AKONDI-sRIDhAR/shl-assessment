@@ -6,4 +6,5 @@ numpy
 requests
 beautifulsoup4
 lxml
-scikit-learn
+fastapi
+uvicorn

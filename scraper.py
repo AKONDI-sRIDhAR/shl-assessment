@@ -1,357 +1,367 @@
 """
-=============================================================================
-SHL Assessment Catalog Scraper
-=============================================================================
-Scrapes "Individual Test Solutions" (type=1) from the SHL Product Catalog:
-  https://www.shl.com/products/product-catalog/?type=1
+scraper.py -- SHL Product Catalog Scraper
+==========================================
+Scrapes the "Individual Test Solutions" section of SHL's Product Catalog.
+URL pattern: https://www.shl.com/products/product-catalog/?type=1&start=N
 
-Pagination: ?type=1&start=0,12,24,...,372  (~32 pages, ~380 assessments)
+Two phases:
+  1. Listing phase  – crawl all paginated listing pages, collect assessment
+     names and detail-page URLs into data/assessments.csv.
+  2. Detail phase   – visit each detail page and pull description, duration,
+     job levels, languages, and test-type badges. Results go into
+     data/assessments_full.csv.
 
-For each assessment it extracts:
-  - name          : Assessment title
-  - url           : Full absolute URL to the detail page
-  - test_types    : Space-separated test type letters (K, P, A, B, etc.)
-  - rich_text     : Combined text blob for embedding generation
+After scraping, the script generates sentence-transformer embeddings and
+stores them in a FAISS index (data/faiss_index.bin + data/metadata.pkl).
 
-Detail page fields:
-  - description   : Full description paragraph
-  - duration      : Assessment length / completion time
-  - job_levels    : Target job levels
-  - languages     : Available languages
+The detail phase is **resumable**: if the script is interrupted and re-run,
+it will skip any assessment that already has a description.
 
-Output  : data/assessments.csv
-Schedule: Run once; data changes infrequently.
-=============================================================================
+Usage:
+    python scraper.py        # first run: scrapes listing + details + embeddings
+    python scraper.py        # second run: resumes where it left off
 """
 
 import os
 import re
+import sys
 import csv
 import time
 import pickle
 import requests
 import numpy as np
+import pandas as pd
 from bs4 import BeautifulSoup
 
+# -- make sure we don't crash on Windows with non-ASCII output --
+if sys.platform == "win32":
+    import io
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 # ---------------------------------------------------------------------------
-# Configuration
+# paths
 # ---------------------------------------------------------------------------
-BASE_URL = "https://www.shl.com/products/product-catalog/"
-CATALOG_URL = BASE_URL + "?type=1"
-START_VALUES = list(range(0, 384, 12))  # 0, 12, 24, ..., 372
-SLEEP_BETWEEN_DETAIL = 0.6              # polite delay per detail request
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-OUTPUT_CSV = os.path.join(OUTPUT_DIR, "assessments.csv")
-METADATA_PKL = os.path.join(OUTPUT_DIR, "metadata.pkl")
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(SCRIPT_DIR, "data")
+LISTING_CSV = os.path.join(DATA_DIR, "assessments.csv")      # phase-1 output
+FULL_CSV    = os.path.join(DATA_DIR, "assessments_full.csv")  # phase-2 output
+FAISS_PATH  = os.path.join(DATA_DIR, "faiss_index.bin")
+META_PATH   = os.path.join(DATA_DIR, "metadata.pkl")
+
+CATALOG_BASE = "https://www.shl.com/products/product-catalog/"
+CATALOG_URL  = CATALOG_BASE + "?type=1"
+PAGE_STARTS  = list(range(0, 384, 12))   # 32 pages, 12 items each
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
 }
 
 
-# ---------------------------------------------------------------------------
-# Helper: Parse test-type badges from a page's HTML
-# ---------------------------------------------------------------------------
-def extract_test_types_from_soup(soup):
+# ========================================================================== #
+#  PHASE 1 -- listing pages                                                  #
+# ========================================================================== #
+
+def fetch_listing_pages():
     """
-    SHL pages show test-type badges as single-letter spans inside a
-    styled container.  We look for the common patterns:
-      - <span class="product-catalogue__key">K</span>
-      - Or the letters A, B, C, D, E, K, P, S inside badge containers
-    Returns a space-separated string like "K P".
+    Crawl all paginated catalog pages and return a list of dicts:
+    [{"name": "...", "url": "https://..."}, ...]
     """
-    valid_letters = {"A", "B", "C", "D", "E", "K", "P", "S"}
+    assessments = []
+    seen = set()
+
+    for start in PAGE_STARTS:
+        url = f"{CATALOG_URL}&start={start}" if start else CATALOG_URL
+        print(f"  Listing page start={start}")
+
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"    WARNING: {exc}")
+            continue
+
+        soup = BeautifulSoup(r.text, "lxml")
+        for a in soup.select("a[href*='/products/product-catalog/view/']"):
+            href = a.get("href", "").strip()
+            name = a.get_text(strip=True)
+            if not name or not href:
+                continue
+            if href.startswith("/"):
+                href = "https://www.shl.com" + href
+            if href not in seen:
+                seen.add(href)
+                assessments.append({"name": name, "url": href})
+
+        time.sleep(0.25)
+
+    return assessments
+
+
+def save_listing(assessments):
+    """Write the basic listing CSV (name + url only)."""
+    with open(LISTING_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["name", "url"], extrasaction="ignore")
+        w.writeheader()
+        w.writerows(assessments)
+
+
+# ========================================================================== #
+#  PHASE 2 -- detail pages (resumable)                                       #
+# ========================================================================== #
+
+def _extract_test_types(soup):
+    """Pull single-letter test-type badges (K, P, A, B, ...) from the page."""
+    valid = set("ABCDEKPS")
     found = []
 
-    # Method 1: look for specific badge/key spans
+    # branded badge spans
     for span in soup.select("span.product-catalogue__key"):
-        letter = span.get_text(strip=True).upper()
-        if letter in valid_letters and letter not in found:
-            found.append(letter)
+        ch = span.get_text(strip=True).upper()
+        if ch in valid and ch not in found:
+            found.append(ch)
 
-    # Method 2: fallback — look inside catalogue-badge containers
+    # fallback: regex on raw text
     if not found:
-        for el in soup.select(".product-catalogue-badge, .catalogue-badge, .badge"):
-            letter = el.get_text(strip=True).upper()
-            if len(letter) == 1 and letter in valid_letters and letter not in found:
-                found.append(letter)
-
-    # Method 3: broad fallback — look for "Test Type:" text in the page
-    if not found:
-        text = soup.get_text()
-        match = re.search(r"Test Type[s]?:\s*([A-Z](?:\s*,?\s*[A-Z])*)", text)
-        if match:
-            for ch in match.group(1):
-                if ch in valid_letters and ch not in found:
+        m = re.search(r"Test Type[s]?:\s*([A-Z](?:\s*,?\s*[A-Z])*)", soup.get_text())
+        if m:
+            for ch in m.group(1):
+                if ch in valid and ch not in found:
                     found.append(ch)
 
     return " ".join(found)
 
 
-# ---------------------------------------------------------------------------
-# Step 1: Scrape catalog listing pages to get assessment names + URLs
-# ---------------------------------------------------------------------------
-def scrape_catalog_listing():
+def _find_section_text(soup, keyword):
     """
-    Iterate over all pagination pages and collect (name, url) tuples.
+    Look for an <h4>/<h3>/<strong> whose text contains `keyword`,
+    then grab everything until the next heading.
     """
-    assessments = []
-    seen_urls = set()
-
-    for start in START_VALUES:
-        page_url = f"{CATALOG_URL}&start={start}" if start > 0 else CATALOG_URL
-        print(f"[Catalog] Fetching page start={start} -> {page_url}")
-
-        try:
-            resp = requests.get(page_url, headers=HEADERS, timeout=30)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  [WARN] Error fetching {page_url}: {e}")
-            continue
-
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # Find assessment links — they point to /products/product-catalog/view/<slug>/
-        for a_tag in soup.select("a[href*='/products/product-catalog/view/']"):
-            href = a_tag.get("href", "").strip()
-            name = a_tag.get_text(strip=True)
-
-            # Skip empty / navigation links
-            if not name or not href:
-                continue
-
-            # Build absolute URL
-            if href.startswith("/"):
-                href = "https://www.shl.com" + href
-
-            if href not in seen_urls:
-                seen_urls.add(href)
-                assessments.append({"name": name, "url": href})
-
-        time.sleep(0.3)  # small delay between listing pages
-
-    print(f"\n[OK] Found {len(assessments)} unique assessments from catalog.\n")
-    return assessments
+    header = soup.find(
+        lambda t: t.name in ("h4", "h3", "h2", "strong")
+        and keyword in t.get_text(strip=True).lower()
+    )
+    if not header:
+        return ""
+    parts = []
+    for sib in header.find_next_siblings():
+        if sib.name in ("h4", "h3", "h2"):
+            break
+        txt = sib.get_text(strip=True)
+        if txt:
+            parts.append(txt)
+    return " ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Step 2: Visit each detail page and extract rich metadata
-# ---------------------------------------------------------------------------
-def scrape_detail_page(url):
+def scrape_detail(url):
     """
-    Visit a single assessment detail page and extract:
-      - description, duration, job_levels, languages, test_types
-    Returns a dict with these fields.
+    Fetch one detail page and return a dict with description,
+    duration, job_levels, languages, and test_types.
     """
-    detail = {
-        "description": "",
-        "duration": "",
-        "job_levels": "",
-        "languages": "",
-        "test_types": "",
-    }
+    blank = dict(description="", duration="", job_levels="", languages="", test_types="")
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"    [WARN] Error fetching detail {url}: {e}")
-        return detail
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"    FAILED: {exc}")
+        return blank
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    page_text = soup.get_text(separator="\n")
+    soup = BeautifulSoup(r.text, "lxml")
+    text = soup.get_text(separator="\n")
 
-    # --- Description ---
-    # Usually under <h4>Description</h4> or similar
-    desc_header = soup.find(
-        lambda tag: tag.name in ["h4", "h3", "h2", "strong"]
-        and "description" in tag.get_text(strip=True).lower()
-    )
-    if desc_header:
-        # Grab next sibling paragraph(s)
-        desc_parts = []
-        for sib in desc_header.find_next_siblings():
-            if sib.name in ["h4", "h3", "h2"]:
-                break
-            text = sib.get_text(strip=True)
-            if text:
-                desc_parts.append(text)
-        detail["description"] = " ".join(desc_parts)
-    else:
-        # Fallback: grab from meta og:description
+    # description
+    desc = _find_section_text(soup, "description")
+    if not desc:
         og = soup.find("meta", attrs={"property": "og:description"})
-        if og:
-            detail["description"] = og.get("content", "")
+        desc = og["content"] if og and og.get("content") else ""
 
-    # --- Duration / Assessment Length ---
-    duration_match = re.search(
-        r"(?:Approximate Completion Time|Assessment [Ll]ength)[^\d]*(\d+)\s*(?:minutes|mins?)?",
-        page_text,
-        re.IGNORECASE,
+    # duration
+    dur_match = re.search(
+        r"(?:Approximate Completion Time|Assessment [Ll]ength)[^\d]*(\d+)", text, re.I
     )
-    if duration_match:
-        detail["duration"] = f"{duration_match.group(1)} minutes"
-    else:
-        # Broader search
-        dur2 = re.search(r"(\d+)\s*(?:minutes|mins)", page_text, re.IGNORECASE)
-        if dur2:
-            detail["duration"] = f"{dur2.group(1)} minutes"
+    duration = f"{dur_match.group(1)} minutes" if dur_match else ""
+    if not duration:
+        dur2 = re.search(r"(\d+)\s*(?:minutes|mins)", text, re.I)
+        duration = f"{dur2.group(1)} minutes" if dur2 else ""
 
-    # --- Job Levels ---
-    jl_header = soup.find(
-        lambda tag: tag.name in ["h4", "h3", "h2", "strong"]
-        and "job level" in tag.get_text(strip=True).lower()
+    # job levels
+    job_levels = _find_section_text(soup, "job level")
+    if not job_levels:
+        jl = re.search(r"Job [Ll]evels?\s*[:\-]?\s*(.+?)(?:\n|$)", text)
+        job_levels = jl.group(1).strip().rstrip(",") if jl else ""
+
+    # languages
+    languages = _find_section_text(soup, "language")
+    if not languages:
+        lm = re.search(r"Languages?\s*[:\-]?\s*(.+?)(?:\n|$)", text)
+        languages = lm.group(1).strip().rstrip(",") if lm else ""
+
+    # test types
+    test_types = _extract_test_types(soup)
+
+    return dict(
+        description=desc, duration=duration,
+        job_levels=job_levels, languages=languages,
+        test_types=test_types,
     )
-    if jl_header:
-        parts = []
-        for sib in jl_header.find_next_siblings():
-            if sib.name in ["h4", "h3", "h2"]:
-                break
-            text = sib.get_text(strip=True)
-            if text:
-                parts.append(text)
-        detail["job_levels"] = ", ".join(parts)
-    else:
-        jl_match = re.search(
-            r"Job [Ll]evels?\s*[:\-]?\s*(.+?)(?:\n|$)", page_text
-        )
-        if jl_match:
-            detail["job_levels"] = jl_match.group(1).strip().rstrip(",")
-
-    # --- Languages ---
-    lang_header = soup.find(
-        lambda tag: tag.name in ["h4", "h3", "h2", "strong"]
-        and "language" in tag.get_text(strip=True).lower()
-    )
-    if lang_header:
-        parts = []
-        for sib in lang_header.find_next_siblings():
-            if sib.name in ["h4", "h3", "h2"]:
-                break
-            text = sib.get_text(strip=True)
-            if text:
-                parts.append(text)
-        detail["languages"] = ", ".join(parts)
-    else:
-        lang_match = re.search(
-            r"Languages?\s*[:\-]?\s*(.+?)(?:\n|$)", page_text
-        )
-        if lang_match:
-            detail["languages"] = lang_match.group(1).strip().rstrip(",")
-
-    # --- Test Types ---
-    detail["test_types"] = extract_test_types_from_soup(soup)
-
-    return detail
 
 
-# ---------------------------------------------------------------------------
-# Step 3: Build rich_text for embedding generation
-# ---------------------------------------------------------------------------
-def build_rich_text(name, detail):
-    """
-    Compose the rich_text string that will be embedded.
-    """
+def build_rich_text(row):
+    """Combine all fields into a single text blob for the embedding model."""
     return (
-        f"Title: {name}\n"
-        f"Description: {detail['description']}\n"
-        f"Test Types: {detail['test_types']}\n"
-        f"Duration: {detail['duration']}\n"
-        f"Job Levels: {detail['job_levels']}"
+        f"Title: {row.get('name', '')}\n"
+        f"Description: {row.get('description', '')}\n"
+        f"Test Types: {row.get('test_types', '')}\n"
+        f"Duration: {row.get('duration', '')}\n"
+        f"Job Levels: {row.get('job_levels', '')}"
     )
 
 
-# ---------------------------------------------------------------------------
-# Step 4: Generate embeddings and FAISS index
-# ---------------------------------------------------------------------------
-def generate_embeddings_and_index(assessments):
+def save_full_csv(rows):
+    """Write the enriched CSV checkpoint."""
+    cols = ["name", "url", "test_types", "description",
+            "duration", "job_levels", "languages", "rich_text"]
+    with open(FULL_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def run_detail_phase(assessments):
     """
-    Generate sentence-transformer embeddings for all assessments
-    and build a FAISS index for fast similarity search.
+    Scrape every detail page that doesn't already have a description.
+    Save a checkpoint every 30 rows.  Keeps a 0.8-second delay between
+    requests to stay polite.
+    """
+    total   = len(assessments)
+    pending = [i for i, a in enumerate(assessments) if not a.get("description", "").strip()]
+    done    = total - len(pending)
+
+    if done:
+        print(f"  Resuming: {done} already done, {len(pending)} remaining.")
+    else:
+        print(f"  Scraping detail pages for {total} assessments...")
+
+    for count, idx in enumerate(pending, start=1):
+        row  = assessments[idx]
+        name = row["name"]
+        print(f"  Scraping {done + count}/{total}: {name[:60]}")
+
+        detail = scrape_detail(row["url"])
+        row.update(detail)
+        row["rich_text"] = build_rich_text(row)
+
+        # checkpoint every 30
+        if count % 30 == 0:
+            save_full_csv(assessments)
+            print(f"    [checkpoint saved at {done + count}/{total}]")
+
+        time.sleep(0.8)
+
+    # final save
+    save_full_csv(assessments)
+    print(f"  All {total} assessments saved to {FULL_CSV}")
+
+
+# ========================================================================== #
+#  PHASE 3 -- embeddings + FAISS                                             #
+# ========================================================================== #
+
+def build_index(assessments):
+    """
+    Encode every assessment's rich_text with sentence-transformers and
+    drop the vectors into a FAISS inner-product index (which equals cosine
+    similarity when the vectors are L2-normalised).
     """
     from sentence_transformers import SentenceTransformer
     import faiss
 
-    print("\n[LOAD] Loading sentence-transformers model (all-MiniLM-L6-v2)...")
+    print("  Loading embedding model (all-MiniLM-L6-v2) ...")
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-    # Extract rich_text for embedding
-    texts = [a["rich_text"] for a in assessments]
-    print(f"[INFO] Generating embeddings for {len(texts)} assessments...")
-    embeddings = model.encode(texts, show_progress_bar=True, normalize_embeddings=True)
-    embeddings = np.array(embeddings, dtype="float32")
+    texts = [a.get("rich_text") or a.get("name", "") for a in assessments]
+    print(f"  Encoding {len(texts)} assessments ...")
+    vecs = model.encode(texts, show_progress_bar=True,
+                        normalize_embeddings=True, batch_size=64)
+    vecs = np.array(vecs, dtype="float32")
 
-    # Build FAISS index (Inner Product = cosine similarity when vectors are normalized)
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)  # Inner Product on normalized vectors = cosine sim
-    index.add(embeddings)
+    dim   = vecs.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(vecs)
 
-    # Save FAISS index
-    faiss_path = os.path.join(OUTPUT_DIR, "faiss_index.bin")
-    faiss.write_index(index, faiss_path)
-    print(f"[OK] FAISS index saved to {faiss_path}  (dim={dim}, n={index.ntotal})")
+    faiss.write_index(index, FAISS_PATH)
+    print(f"  FAISS index saved  -> {FAISS_PATH}  ({index.ntotal} vectors, dim={dim})")
 
-    # Save metadata (list of dicts with name, url, test_types, rich_text, etc.)
-    with open(METADATA_PKL, "wb") as f:
+    with open(META_PATH, "wb") as f:
         pickle.dump(assessments, f)
-    print(f"[OK] Metadata saved to {METADATA_PKL}")
-
-    return index, embeddings
+    print(f"  Metadata pickle    -> {META_PATH}")
 
 
-# ---------------------------------------------------------------------------
-# Main orchestrator
-# ---------------------------------------------------------------------------
+# ========================================================================== #
+#  main                                                                      #
+# ========================================================================== #
+
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print("=" * 70)
-    print("  SHL Assessment Catalog Scraper")
-    print("=" * 70)
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    # Step 1: Scrape listing pages
-    assessments = scrape_catalog_listing()
+    print("=" * 60)
+    print("  SHL Product Catalog Scraper")
+    print("=" * 60)
+    t0 = time.time()
 
-    if not assessments:
-        print("[ERROR] No assessments found. Exiting.")
-        return
+    # --- try to resume from enriched CSV ---
+    if os.path.exists(FULL_CSV):
+        print("\nPhase 1: Loading existing enriched data ...")
+        df = pd.read_csv(FULL_CSV, encoding="utf-8").fillna("")
+        assessments = df.to_dict("records")
+        print(f"  Loaded {len(assessments)} rows from {FULL_CSV}")
 
-    # Step 2: Scrape each detail page
-    total = len(assessments)
-    for idx, a in enumerate(assessments, 1):
-        print(f"  [{idx}/{total}] Scraping detail: {a['name']}")
-        detail = scrape_detail_page(a["url"])
+    elif os.path.exists(LISTING_CSV):
+        print("\nPhase 1: Loading existing listing ...")
+        df = pd.read_csv(LISTING_CSV, encoding="utf-8").fillna("")
+        assessments = df.to_dict("records")
+        print(f"  Loaded {len(assessments)} rows from {LISTING_CSV}")
 
-        # Merge detail fields into the assessment dict
-        a["test_types"] = detail["test_types"]
-        a["description"] = detail["description"]
-        a["duration"] = detail["duration"]
-        a["job_levels"] = detail["job_levels"]
-        a["languages"] = detail["languages"]
+    else:
+        print("\nPhase 1: Fetching catalog listing pages ...")
+        assessments = fetch_listing_pages()
+        if not assessments:
+            print("ERROR: no assessments found. Exiting.")
+            return
+        save_listing(assessments)
+        print(f"  {len(assessments)} assessments -> {LISTING_CSV}")
 
-        # Build rich_text
-        a["rich_text"] = build_rich_text(a["name"], detail)
+    # initialise missing fields so the CSV columns are consistent
+    for a in assessments:
+        for col in ("description", "duration", "job_levels",
+                     "languages", "test_types", "rich_text"):
+            a.setdefault(col, "")
 
-        # Polite sleep between detail page requests
-        time.sleep(SLEEP_BETWEEN_DETAIL)
+    # --- detail scraping ---
+    needs_scraping = any(not a.get("description", "").strip() for a in assessments)
+    if needs_scraping:
+        print("\nPhase 2: Detail page scraping ...")
+        run_detail_phase(assessments)
+    else:
+        print("\nPhase 2: All detail pages already scraped, skipping.")
 
-    # Step 3: Save to CSV
-    fieldnames = ["name", "url", "test_types", "rich_text"]
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(assessments)
-    print(f"\n[OK] Saved {len(assessments)} assessments to {OUTPUT_CSV}")
+    # --- embeddings + FAISS ---
+    print("\nPhase 3: Building embeddings and FAISS index ...")
+    build_index(assessments)
 
-    # Step 4: Generate embeddings & FAISS index
-    generate_embeddings_and_index(assessments)
-
-    print("\n" + "=" * 70)
-    print("  [DONE] Scraping complete! All data is in the data/ directory.")
-    print("=" * 70)
+    elapsed = time.time() - t0
+    print("\n" + "=" * 60)
+    print(f"  Done in {elapsed:.0f}s.  Next step: streamlit run app.py")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
