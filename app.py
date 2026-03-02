@@ -2,8 +2,6 @@
 # Run: streamlit run app.py
 
 import streamlit as st
-import pandas as pd
-from utils import recommend, TYPE_NAMES
 
 st.set_page_config(
     page_title="SHL Assessment Recommendation Engine",
@@ -48,6 +46,14 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
+# test type legend (inline so we don't import utils at startup)
+TYPE_NAMES = {
+    "K": "Knowledge & Skills", "P": "Personality & Behavior",
+    "A": "Ability & Aptitude", "B": "Biodata & SJT",
+    "S": "Simulations",       "C": "Competencies",
+    "D": "Development & 360", "E": "Assessment Exercises",
+}
+
 # header
 st.markdown("""
 <div class="hdr">
@@ -83,13 +89,19 @@ for i, ex in enumerate(examples):
         if st.button(ex, key=f"e{i}", use_container_width=True):
             query, go = ex, True
 
-# show results
+# show results -- only import heavy stuff when user clicks
 if go and query.strip():
     st.markdown("---")
-    with st.spinner("Searching..."):
-        results = recommend(query.strip(), top_k=top_k, balance=balance)
+    try:
+        with st.spinner("Loading model and searching (first time takes ~30s)..."):
+            from utils import recommend
+            results = recommend(query.strip(), top_k=top_k, balance=balance)
+    except Exception as e:
+        st.error(f"Error: {e}")
+        results = []
+
     if not results:
-        st.warning("No results. Run scraper.py first.")
+        st.warning("No results. Make sure data/ folder has the index files.")
     else:
         st.markdown(f"**{len(results)} results** for: _{query.strip()}_")
         for i in range(0, len(results), 2):
