@@ -1,20 +1,21 @@
 # utils.py -- core recommendation logic, shared by app.py and api.py
+# heavy imports (torch, faiss, sentence-transformers) are lazy-loaded
+# so the FastAPI server can bind its port before loading the model
 
 import os, re, pickle
 import numpy as np
 import pandas as pd
-import faiss
-from sentence_transformers import SentenceTransformer
 
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-# singletons
+# singletons -- loaded on first request, not at import time
 _model, _index, _meta = None, None, None
 
 
 def get_model():
     global _model
     if _model is None:
+        from sentence_transformers import SentenceTransformer
         _model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     return _model
 
@@ -22,6 +23,7 @@ def get_model():
 def get_index():
     global _index
     if _index is None:
+        import faiss
         path = os.path.join(DIR, "faiss_index.bin")
         if os.path.exists(path):
             _index = faiss.read_index(path)
@@ -140,13 +142,10 @@ def recommend(query, top_k=8, balance=True):
 
 
 def health():
-    ok = {"status": "healthy"}
-    try:
-        get_model()
-        idx = get_index()
-        m = get_meta()
-        if not idx or not m:
-            ok["status"] = "unhealthy"
-    except Exception:
-        ok["status"] = "unhealthy"
-    return ok
+    """Light health check -- doesn't load the model, just checks files exist."""
+    idx_ok = os.path.exists(os.path.join(DIR, "faiss_index.bin"))
+    meta_ok = os.path.exists(os.path.join(DIR, "metadata.pkl")) or \
+              os.path.exists(os.path.join(DIR, "assessments_full.csv"))
+    if idx_ok and meta_ok:
+        return {"status": "healthy"}
+    return {"status": "unhealthy"}

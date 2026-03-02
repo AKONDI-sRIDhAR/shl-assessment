@@ -1,11 +1,11 @@
 # api.py -- FastAPI backend
-# Run: uvicorn api:app --host 0.0.0.0 --port 8000
+# Run: uvicorn api:app --host 0.0.0.0 --port 8080
 
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from utils import recommend, health
 
 app = FastAPI(title="SHL Assessment Recommendation API", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -34,11 +34,15 @@ class RecResp(BaseModel):
 
 @app.get("/health")
 def get_health():
+    # lightweight check -- no model loading
+    from utils import health
     return health()
 
 
 @app.post("/recommend", response_model=RecResp)
 def post_recommend(req: RecReq):
+    # heavy imports happen lazily inside recommend() on first call
+    from utils import recommend
     recs = recommend(req.query, top_k=req.top_k, balance=req.balance)
     items = [
         RecItem(
