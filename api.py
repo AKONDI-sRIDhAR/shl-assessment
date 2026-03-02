@@ -32,18 +32,27 @@ class RecResp(BaseModel):
     results: List[RecItem]
 
 
+@app.get("/")
+def root():
+    return {
+        "message": "SHL Assessment Recommendation API",
+        "endpoints": {
+            "GET /health": "Health check",
+            "POST /recommend": "Get recommendations (body: {query, top_k, balance})",
+            "GET /recommend?query=...": "Get recommendations via query param",
+        }
+    }
+
+
 @app.get("/health")
 def get_health():
-    # lightweight check -- no model loading
     from utils import health
     return health()
 
 
-@app.post("/recommend", response_model=RecResp)
-def post_recommend(req: RecReq):
-    # heavy imports happen lazily inside recommend() on first call
+def _do_recommend(query, top_k=8, balance=True):
     from utils import recommend
-    recs = recommend(req.query, top_k=req.top_k, balance=req.balance)
+    recs = recommend(query, top_k=top_k, balance=balance)
     items = [
         RecItem(
             rank=i+1,
@@ -55,5 +64,14 @@ def post_recommend(req: RecReq):
         )
         for i, r in enumerate(recs)
     ]
-    return RecResp(query=req.query, top_k=req.top_k,
-                   balance=req.balance, results=items)
+    return RecResp(query=query, top_k=top_k, balance=balance, results=items)
+
+
+@app.post("/recommend", response_model=RecResp)
+def post_recommend(req: RecReq):
+    return _do_recommend(req.query, req.top_k, req.balance)
+
+
+@app.get("/recommend", response_model=RecResp)
+def get_recommend(query: str, top_k: int = 8, balance: bool = True):
+    return _do_recommend(query, top_k, balance)

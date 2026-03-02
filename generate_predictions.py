@@ -10,7 +10,7 @@ from utils import recommend
 
 # load datasets
 xl = pd.ExcelFile("data/Gen_AI_Dataset.xlsx")
-train_df = xl.parse("Labelled-Data")
+train_df = xl.parse("Train-Set")
 test_df = xl.parse("Test-Set")
 
 # --- evaluate on train set ---
