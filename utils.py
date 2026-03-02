@@ -1,26 +1,15 @@
-"""
-utils.py -- shared recommendation logic
-Used by both the Streamlit UI (app.py) and the FastAPI backend (api.py).
-"""
+# utils.py -- core recommendation logic, shared by app.py and api.py
 
-import os
-import re
-import pickle
+import os, re, pickle
 import numpy as np
 import pandas as pd
 import faiss
 from sentence_transformers import SentenceTransformer
 
-# paths
-DATA_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-FAISS_PATH = os.path.join(DATA_DIR, "faiss_index.bin")
-META_PATH  = os.path.join(DATA_DIR, "metadata.pkl")
-CSV_PATH   = os.path.join(DATA_DIR, "assessments_full.csv")
+DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-# singletons (loaded once, reused)
-_model = None
-_index = None
-_metadata = None
+# singletons
+_model, _index, _meta = None, None, None
 
 
 def get_model():
@@ -32,127 +21,94 @@ def get_model():
 
 def get_index():
     global _index
-    if _index is None and os.path.exists(FAISS_PATH):
-        _index = faiss.read_index(FAISS_PATH)
+    if _index is None:
+        path = os.path.join(DIR, "faiss_index.bin")
+        if os.path.exists(path):
+            _index = faiss.read_index(path)
     return _index
 
 
-def get_metadata():
-    global _metadata
-    if _metadata is not None:
-        return _metadata
-
-    data = None
-    if os.path.exists(META_PATH):
-        with open(META_PATH, "rb") as f:
-            data = pickle.load(f)
-    if data is None and os.path.exists(CSV_PATH):
-        df = pd.read_csv(CSV_PATH, encoding="utf-8").fillna("")
-        data = df.to_dict("records")
-    if data is None:
-        return None
-
-    # normalise fields
-    for row in data:
-        for k in row:
-            if not isinstance(row[k], str) and k != "score":
-                row[k] = str(row[k]) if row[k] else ""
-        if not row.get("rich_text", "").strip():
-            row["rich_text"] = (
-                f"Title: {row.get('name', '')}\n"
-                f"Test Types: {row.get('test_types', '')}\n"
-                f"Description: {row.get('description', '')}"
-            )
-
-    _metadata = data
-    return _metadata
+def get_meta():
+    global _meta
+    if _meta is not None:
+        return _meta
+    pkl = os.path.join(DIR, "metadata.pkl")
+    csv = os.path.join(DIR, "assessments_full.csv")
+    if os.path.exists(pkl):
+        with open(pkl, "rb") as f:
+            _meta = pickle.load(f)
+    elif os.path.exists(csv):
+        _meta = pd.read_csv(csv, encoding="utf-8").fillna("").to_dict("records")
+    if _meta:
+        for r in _meta:
+            for k in r:
+                if not isinstance(r[k], str) and k != "score":
+                    r[k] = str(r[k]) if r[k] else ""
+            if not r.get("rich_text", "").strip():
+                r["rich_text"] = f"Title: {r.get('name','')}\nTest Types: {r.get('test_types','')}"
+    return _meta
 
 
-# -- keyword sets for K/P balance --
-
-TECH_KW = {
-    "technical", "coding", "programming", "software", "developer", "engineer",
-    "data", "algorithm", "database", "sql", "python", "java", "javascript",
-    "c++", "machine learning", "ai", "cloud", "devops", "testing", "qa",
-    "network", "security", "accounting", "finance", "analytics", "mathematics",
-    "science", "statistics", "excel", "sap", "erp", "it", "infrastructure",
-    "architecture", "framework", ".net", "html", "css", "api", "backend",
-    "frontend", "system", "admin", "skills", "knowledge", "aptitude",
-    "numerical", "verbal", "reasoning", "mechanical",
+# keyword sets for K/P intent detection
+_TECH = {
+    "technical","coding","programming","software","developer","engineer",
+    "data","algorithm","database","sql","python","java","javascript",
+    "machine learning","ai","cloud","devops","testing","qa","network",
+    "security","accounting","finance","analytics","mathematics","excel",
+    "sap","erp","it",".net","html","css","api","backend","frontend",
+    "skills","knowledge","aptitude","numerical","verbal","reasoning",
+}
+_BEHAV = {
+    "leadership","team","teamwork","communication","collaboration",
+    "management","interpersonal","behavior","behavioural","personality",
+    "motivation","culture","conflict","emotional","empathy","coaching",
+    "decision","strategic","vision","influence","negotiation","customer",
+    "service","sales","relationship","adaptability","resilience",
+    "integrity","values","supervisor","manager","director","executive",
 }
 
-BEHAV_KW = {
-    "leadership", "team", "teamwork", "communication", "collaboration",
-    "management", "interpersonal", "behavior", "behavioural", "personality",
-    "motivation", "culture", "conflict", "emotional", "empathy", "coaching",
-    "mentoring", "decision", "strategic", "vision", "influence", "negotiation",
-    "customer", "service", "sales", "relationship", "adaptability", "resilience",
-    "integrity", "values", "attitude", "work style", "cultural fit",
-    "organizational", "supervisor", "manager", "director", "executive",
-}
-
-TYPE_LABELS = {
-    "K": "Knowledge & Skills",
-    "P": "Personality & Behavior",
-    "A": "Ability & Aptitude",
-    "B": "Biodata & SJT",
-    "S": "Simulations",
-    "C": "Competencies",
-    "D": "Development & 360",
-    "E": "Assessment Exercises",
+TYPE_NAMES = {
+    "K": "Knowledge & Skills", "P": "Personality & Behavior",
+    "A": "Ability & Aptitude", "B": "Biodata & SJT",
+    "S": "Simulations",       "C": "Competencies",
+    "D": "Development & 360", "E": "Assessment Exercises",
 }
 
 
-def _intent(query):
-    """Classify query as technical vs behavioural. Returns (tech_ratio, behav_ratio)."""
-    low = query.lower()
+def _intent(q):
+    low = q.lower()
     words = set(re.findall(r"\b\w+\b", low))
-    t = len(words & TECH_KW)  + sum(1 for k in TECH_KW  if " " in k and k in low)
-    b = len(words & BEHAV_KW) + sum(1 for k in BEHAV_KW if " " in k and k in low)
+    t = len(words & _TECH)  + sum(1 for k in _TECH  if " " in k and k in low)
+    b = len(words & _BEHAV) + sum(1 for k in _BEHAV if " " in k and k in low)
     s = t + b
-    return (t / s, b / s) if s else (0.5, 0.5)
+    return (t/s, b/s) if s else (0.5, 0.5)
 
 
 def _reason(row, query, score):
-    """Short explanation for why this assessment was recommended."""
-    qwords = set(re.findall(r"\b\w{3,}\b", query.lower()))
-    blob = (row.get("rich_text", "") + " " + row.get("name", "")).lower()
-    stop = {"the", "and", "for", "with", "that", "this", "are", "was", "has",
-            "not", "some", "can", "also", "who", "what", "how", "suggest",
-            "need", "want", "looking", "hiring", "available", "assessments",
-            "assessment", "me"}
-    hits = sorted([w for w in qwords if w in blob and w not in stop])[:5]
-
-    types = row.get("test_types", "")
-    covers = ", ".join(TYPE_LABELS.get(t, t) for t in types.split() if t in TYPE_LABELS)
-
-    parts = []
+    qw = set(re.findall(r"\b\w{3,}\b", query.lower()))
+    blob = (row.get("rich_text","") + " " + row.get("name","")).lower()
+    skip = {"the","and","for","with","that","this","are","was","not","some",
+            "can","also","who","what","how","suggest","need","want","looking",
+            "hiring","available","assessments","assessment","me","has"}
+    hits = sorted([w for w in qw if w in blob and w not in skip])[:5]
+    types = row.get("test_types","")
+    covers = ", ".join(TYPE_NAMES[t] for t in types.split() if t in TYPE_NAMES)
     if hits:
-        parts.append(f"Matches: {', '.join(hits)}")
+        out = f"Matches: {', '.join(hits)}"
     else:
-        parts.append(f"Semantic similarity ({score:.2f})")
+        out = f"Semantic match ({score:.2f})"
     if covers:
-        parts.append(f"Type: {covers}")
-    return ". ".join(parts) + "."
+        out += f". Type: {covers}"
+    return out + "."
 
 
-# -- core function --
-
-def recommend(query: str, top_k: int = 8, balance: bool = True) -> list:
-    """
-    Returns up to top_k assessment dicts sorted by relevance.
-    Each dict has: name, url, score, test_types, reason, description, etc.
-    """
-    model = get_model()
-    index = get_index()
-    meta = get_metadata()
-
-    if index is None or meta is None:
+def recommend(query, top_k=8, balance=True):
+    """Return up to top_k ranked assessment dicts."""
+    model, index, meta = get_model(), get_index(), get_meta()
+    if not index or not meta:
         return []
 
     vec = model.encode([query], normalize_embeddings=True).astype("float32")
-
-    # pull extra candidates when balancing so we can re-rank
     k = min(top_k * 3, index.ntotal) if balance else top_k
     scores, ids = index.search(vec, k)
 
@@ -165,44 +121,32 @@ def recommend(query: str, top_k: int = 8, balance: bool = True) -> list:
         item["reason"] = _reason(item, query, float(s))
         results.append(item)
 
-    # K/P boost
+    # boost K/A for technical queries, P/B for behavioural
     if balance and results:
         tr, br = _intent(query)
         for r in results:
-            tt = r.get("test_types", "")
-            boost = 0.0
-            if "K" in tt and tr > 0.5: boost += 0.05 * tr
-            if "A" in tt and tr > 0.5: boost += 0.03 * tr
-            if "P" in tt and br > 0.5: boost += 0.05 * br
-            if "B" in tt and br > 0.5: boost += 0.03 * br
-            r["score"] = min(r["score"] + boost, 1.0)
+            tt = r.get("test_types","")
+            b = 0.0
+            if "K" in tt and tr > 0.5: b += 0.05 * tr
+            if "A" in tt and tr > 0.5: b += 0.03 * tr
+            if "P" in tt and br > 0.5: b += 0.05 * br
+            if "B" in tt and br > 0.5: b += 0.03 * br
+            r["score"] = min(r["score"] + b, 1.0)
         results.sort(key=lambda x: x["score"], reverse=True)
 
     for r in results:
         r["score"] = max(0.0, min(1.0, r["score"]))
-
     return results[:top_k]
 
 
-def health_check():
-    """Returns a dict describing system health."""
-    status = {"status": "healthy", "components": {}}
+def health():
+    ok = {"status": "healthy"}
     try:
         get_model()
-        status["components"]["model"] = "ok"
-    except Exception as e:
-        status["components"]["model"] = str(e)
-        status["status"] = "unhealthy"
-    try:
         idx = get_index()
-        status["components"]["faiss"] = "ok" if idx else "missing"
-    except Exception as e:
-        status["components"]["faiss"] = str(e)
-        status["status"] = "unhealthy"
-    try:
-        m = get_metadata()
-        status["components"]["metadata"] = f"ok ({len(m)} items)" if m else "missing"
-    except Exception as e:
-        status["components"]["metadata"] = str(e)
-        status["status"] = "unhealthy"
-    return status
+        m = get_meta()
+        if not idx or not m:
+            ok["status"] = "unhealthy"
+    except Exception:
+        ok["status"] = "unhealthy"
+    return ok

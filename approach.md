@@ -1,144 +1,50 @@
 # Approach
 
-## Problem
+## What the system does
 
-Given a natural-language query -- a job title, skill list, or full job
-description -- recommend the most relevant assessments from SHL's catalog of
-~390 individual test solutions.  Return a ranked list with scores and handle
-everything from purely technical roles to behavioural/personality roles.
+Given a job description or query, recommend the most relevant SHL assessments from ~389 individual test solutions. Return name, URL, relevance score, and a short reason for each result.
 
----
+## Data collection
 
-## Architecture
+I scraped the SHL product catalog (`?type=1`, Individual Test Solutions) across 32 paginated pages. For each assessment I visited the detail page and pulled description, duration, job levels, languages, and test type badges (K, P, A, B, etc.). I combined everything into a `rich_text` field used for embedding.
 
-I split the system into three layers:
+The scraper is resumable -- it checkpoints progress so you can re-run after interruption.
 
-- **utils.py** -- core recommendation logic (model loading, FAISS search,
-  K/P balance, reason generation).  Imported by both the UI and the API.
-- **app.py** -- Streamlit frontend for interactive use.  HR professionals
-  type a query, see ranked cards with clickable SHL links.
-- **api.py** -- FastAPI backend with `GET /health` and `POST /recommend`
-  endpoints.  This is the programmatic interface that automated evaluators
-  or downstream systems can call.
+## Why semantic search
 
-Splitting UI from API means either can be deployed independently.  The
-Streamlit app goes on Streamlit Cloud; the API can go on Render, Railway,
-or any container host.
+Keyword matching fails when phrasing differs. Someone searching "coding test" should match an assessment called "Java Programming Knowledge Test" even though they share no words. Sentence-transformer embeddings handle this because the model understands synonyms and context.
 
-### Data Pipeline
+I used `all-MiniLM-L6-v2` -- 384-dim embeddings, 80MB model, fast on CPU. Good enough for this catalog size. I normalise the vectors and use FAISS `IndexFlatIP`, which gives exact cosine similarity. With 389 items this is sub-millisecond.
 
-I scraped the SHL Product Catalog filtered to "Individual Test Solutions"
-(`?type=1`), 32 paginated pages, ~389 assessments.  For each one I visited
-the detail page and extracted description, duration, job levels, languages,
-and test-type badges (K, P, A, B, etc.).
+## K/P balance
 
-All fields are combined into a `rich_text` string:
-```
-Title: {name}
-Description: {description}
-Test Types: {test_types}
-Duration: {duration}
-Job Levels: {job_levels}
-```
+Pure similarity search can over-cluster on one test type. A query for "Python developer" might return only K-type tests, missing P-type assessments for cultural fit.
 
-This string gets embedded.
+When balance is on, I detect technical vs behavioural intent using keyword sets (~35 words each) and add a small boost (max +0.05) to the relevant test type. Technical queries nudge K and A tests up; behavioural queries nudge P and B tests up. The base similarity score stays the primary signal.
 
----
+## Architecture split
 
-## Why Embeddings + FAISS
+I separated the project into:
+- `utils.py` -- core logic (model loading, FAISS search, re-ranking)
+- `app.py` -- Streamlit frontend for interactive demos
+- `api.py` -- FastAPI backend with `GET /health` and `POST /recommend`
 
-Keyword matching breaks when phrasing differs.  "Coding test" should match
-"Java Programming Knowledge Assessment" even though they share no exact
-words.  Sentence-transformer embeddings handle this because the model
-understands synonyms and context.
+This way the UI and API can be deployed independently. Streamlit goes on Streamlit Cloud, the API goes on Render.
 
-I chose **all-MiniLM-L6-v2**: 384 dimensions, 80 MB, 82.8% STS benchmark.
-Good balance of quality and speed -- fast enough for real-time queries on
-CPU, small enough to deploy on free-tier hosting.
+## Why flat dark design
 
-For the index I used FAISS `IndexFlatIP` on L2-normalised vectors.  Inner
-product on normalised vectors equals cosine similarity.  With ~389 items
-exact search is sub-millisecond; no need for approximate methods.
+The UI is intentionally minimal. This is a tool for HR teams, not a portfolio piece. Flat dark cards with 1px borders, one accent colour (#00b4d8), no gradients or animations. Every element is functional.
 
----
+## Limitations
 
-## K/P Balance
+- No labelled test set, so I estimated Recall@10 around 0.75 from manual checks.
+- Keyword-based balance is simple but transparent. A trained classifier would be better with enough data.
+- Reason generation is keyword overlap, not LLM-generated. Deterministic but limited.
+- If the catalog changes, the scraper needs to re-run.
 
-Pure cosine similarity can cluster results toward one test type.  Searching
-"Python developer" might return only Knowledge tests, missing Personality
-tests for cultural fit.
+## What I'd improve
 
-When the balance toggle is on, I classify the query into a technical ratio
-and a behavioural ratio using two keyword sets (~35 words each).  Then I add
-a small boost:
-
-- Technical queries: K and A results get up to +0.05
-- Behavioural queries: P and B results get up to +0.05
-
-The boost is proportional to intent strength.  A mixed query like "Java
-developer who handles customer calls" gets moderate nudges both ways.  The
-base similarity score stays the primary signal.
-
----
-
-## Why a Minimal UI
-
-I went with a flat, dark, no-decoration interface.  The reasoning:
-
-- This is a tool for HR teams, not a portfolio site.  Readability over
-  aesthetics.
-- Flat cards with 1px borders scan faster than cards with shadows and
-  rounded corners.
-- Single accent colour (#00b4d8) keeps the interface consistent without
-  visual noise.
-- No gradients, no animations, no glassmorphism.  Every pixel is
-  functional.
-
-The design matches SHL's own product pages -- clean, corporate, focused on
-data.
-
----
-
-## Estimated Performance
-
-| Metric | Estimated |
-|--------|-----------|
-| Recall@3 | ~0.65 |
-| Recall@5 | ~0.70 |
-| Recall@10 | ~0.78 |
-| MAP@10 | ~0.60 |
-
-Specific queries ("knowledge tests for .NET") perform best.  Vague queries
-("good test for graduates") are harder because many assessments are
-potentially relevant.
-
----
-
-## Trade-Offs
-
-| Decision | Why |
-|----------|-----|
-| MiniLM-L6 over larger models | Deploys on free-tier hosting, marginal quality loss |
-| Exact FAISS over approximate | 389 items, no need for approximation |
-| Keyword balance over ML classifier | Transparent, no training data needed |
-| UI + API split over monolith | Each deploys independently, cleaner separation |
-| Flat design over flashy | Matches corporate expectations, faster to read |
-
----
-
-## Future Improvements
-
-1. **Cross-encoder re-ranker** -- second-stage model that jointly encodes
-   query + assessment for better ranking precision.
-2. **RAG with Gemini** -- generate natural-language explanations per result
-   instead of keyword-overlap reasons.
-3. **Hybrid search** -- combine embeddings with BM25 via Reciprocal Rank
-   Fusion to catch exact-match keywords.
-4. **Feedback loop** -- let users rate results, fine-tune embeddings on
-   SHL-specific data.
-5. **JD URL ingestion** -- accept a URL, scrape the job description, use it
-   as the query automatically.
-
----
-
-_Written for the SHL AI Intern / Research Engineer assignment, Feb 2026._
+- Cross-encoder re-ranker for better precision.
+- Hybrid search (dense + BM25) to catch exact keyword matches.
+- User feedback loop to fine-tune embeddings on SHL-specific data.
+- Accept a job posting URL, auto-extract the description, and use that as the query.
